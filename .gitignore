@@ -1,0 +1,12 @@
+
+**/.claude/
+**/.agents/
+.env
+__pycache__/
+node_modules/
+target/
+.pixi/
+.DS_Store
+.vscode/
+.idea/
+**/skills-lock.json

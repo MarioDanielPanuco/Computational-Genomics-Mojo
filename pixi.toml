@@ -1,0 +1,21 @@
+[workspace]
+name = "computational-genomics"
+version = "0.1.0"
+description = "Performance-oriented genomics library with GPU-accelerated kernels in Mojo"
+channels = ["https://conda.modular.com/max-nightly/", "conda-forge"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+max = "*"
+
+[tasks]
+test         = "mojo test tests/"
+bench-kmer   = "mojo run benchmarks/bench_kmer.mojo"
+bench-align  = "mojo run benchmarks/bench_alignment.mojo"
+build        = "mojo package genomics -o genomics.mojopkg"
+
+[feature.dev.dependencies]
+python = ">=3.11"
+
+[feature.dev.tasks]
+fmt = "mojo format genomics/ benchmarks/ tests/"
