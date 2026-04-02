@@ -10,7 +10,7 @@ from std.sys import has_accelerator
 
 
 @fieldwise_init
-struct BenchResult(Movable, Writable):
+struct BenchResult(Copyable, Movable, Writable):
     """Summary of a single benchmark run."""
     var name: String
     var device: String      # "cpu" or "gpu"
@@ -33,7 +33,7 @@ def print_results(results: List[BenchResult]):
     print("{:<30} {:<5} {:>14} {:>12}".format("Name", "Dev", "Throughput", "Latency"))
     print("-" * 70)
     for i in range(len(results)):
-        var r = results[i]
+        var r = results[i].copy()
         print("{:<30} {:<5} {:>12.3f} Gb/s {:>10.1f} ns".format(
             r.name, r.device, r.throughput_gbps, r.mean_ns))
     print("=" * 70)
@@ -49,7 +49,7 @@ def make_random_dna(length: Int) -> List[UInt8]:
         state = state * 6364136223846793005 + 1442695040888963407
         var idx = Int((state >> 62) & 3)
         seq.append(bases[idx])
-    return seq
+    return seq^
 
 
 def make_random_batch(n_seqs: Int, seq_len: Int) -> List[List[UInt8]]:
@@ -64,4 +64,4 @@ def make_random_batch(n_seqs: Int, seq_len: Int) -> List[List[UInt8]]:
             var idx = Int((state >> 62) & 3)
             seq.append(bases[idx])
         batch.append(seq^)
-    return batch
+    return batch^

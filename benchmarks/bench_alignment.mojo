@@ -21,8 +21,8 @@ from genomics.cpu.align_cpu import (
 from benchmarks.harness import make_random_batch, make_random_dna
 
 
-def build_pair_batch(n_pairs: Int, seq_len: Int) -> (SequenceBatch, SequenceBatch):
-    """Build query and reference batches for pairwise alignment benchmarks."""
+def bench_sw_cpu[band: Int](n_pairs: Int, seq_len: Int) raises:
+    """Benchmark CPU Smith-Waterman for n_pairs at given band and seq_len."""
     var q_seqs = make_random_batch(n_pairs, seq_len)
     var r_seqs = make_random_batch(n_pairs, seq_len)
     var queries = SequenceBatch(capacity=n_pairs)
@@ -30,12 +30,7 @@ def build_pair_batch(n_pairs: Int, seq_len: Int) -> (SequenceBatch, SequenceBatc
     for i in range(n_pairs):
         queries.add_sequence(Span(q_seqs[i]), seq_len)
         refs.add_sequence(Span(r_seqs[i]), seq_len)
-    return (queries^, refs^)
 
-
-def bench_sw_cpu[band: Int](n_pairs: Int, seq_len: Int):
-    """Benchmark CPU Smith-Waterman for n_pairs at given band and seq_len."""
-    var (queries, refs) = build_pair_batch(n_pairs, seq_len)
     var cfg = default_config()
     cfg.band_width = band
 
@@ -57,9 +52,10 @@ def bench_sw_cpu[band: Int](n_pairs: Int, seq_len: Int):
         BenchId("sw_cpu_band" + String(band) + "_len" + String(seq_len) + "_n" + String(n_pairs)),
         [ThroughputMeasure(BenchMetric.elements, total_cells)],
     )
+    bench.dump_report()
 
 
-def bench_alignment_cpu_scaling():
+def bench_alignment_cpu_scaling() raises:
     """Sweep band widths and sequence lengths for CPU alignment."""
     print("--- CPU SW: band width sweep (seq_len=500, n=100) ---")
     bench_sw_cpu[16](100, 500)
@@ -73,11 +69,18 @@ def bench_alignment_cpu_scaling():
     bench_sw_cpu[32](100, 1000)
 
 
-def bench_nw_vs_sw():
+def bench_nw_vs_sw() raises:
     """Compare NW and SW performance at equal band widths."""
     var n = 200
     var seq_len = 300
-    var (queries, refs) = build_pair_batch(n, seq_len)
+    var q_seqs = make_random_batch(n, seq_len)
+    var r_seqs = make_random_batch(n, seq_len)
+    var queries = SequenceBatch(capacity=n)
+    var refs = SequenceBatch(capacity=n)
+    for i in range(n):
+        queries.add_sequence(Span(q_seqs[i]), seq_len)
+        refs.add_sequence(Span(r_seqs[i]), seq_len)
+
     var cfg = default_config()
     cfg.band_width = 32
 
@@ -98,6 +101,7 @@ def bench_nw_vs_sw():
         BenchId("nw_cpu_band32_len300_n200"),
         [ThroughputMeasure(BenchMetric.elements, n * seq_len * 65)],
     )
+    bench.dump_report()
 
 
 def main() raises:

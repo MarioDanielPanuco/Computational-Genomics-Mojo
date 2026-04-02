@@ -98,4 +98,4 @@ def kmer_frequencies[k: Int](
                 var slot = Int(kmers[i] & mask)
                 counts[slot] += 1
 
-    return counts
+    return counts^

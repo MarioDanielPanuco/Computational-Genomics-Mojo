@@ -150,7 +150,12 @@ def needleman_wunsch_banded(
 
     for j in range(width):
         var ri = -band + j
-        H_prev[j] = max(NEG_INF, cfg.gap_open + ri * cfg.gap_extend) if ri >= 0 else NEG_INF
+        if ri < 0:
+            H_prev[j] = NEG_INF
+        elif ri == 0:
+            H_prev[j] = 0  # H[-1][-1] = 0: zero query and reference bases consumed
+        else:
+            H_prev[j] = cfg.gap_open + ri * cfg.gap_extend
 
     for qi in range(qlen):
         for j in range(width):

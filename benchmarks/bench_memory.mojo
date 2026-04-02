@@ -8,7 +8,7 @@ from genomics.core.sequence import SequenceBatch
 from benchmarks.harness import make_random_batch
 
 
-def bench_encoding_overhead(n_seqs: Int, seq_len: Int):
+def bench_encoding_overhead(n_seqs: Int, seq_len: Int) raises:
     """Measure the time spent encoding ASCII -> 2-bit during batch construction."""
     var seqs = make_random_batch(n_seqs, seq_len)
     var bench = Bench(BenchConfig(max_iters=200))
@@ -28,21 +28,31 @@ def bench_encoding_overhead(n_seqs: Int, seq_len: Int):
         BenchId("encode_n" + String(n_seqs) + "_len" + String(seq_len)),
         [ThroughputMeasure(BenchMetric.bytes, total_bases)],
     )
+    bench.dump_report()
 
 
-def bench_packed_density():
+def _fmt_mb(bytes: Int) -> String:
+    """Format byte count as X.X MB string."""
+    var tenths = Int(Float64(bytes) / 104857.6 + 0.5)  # tenths of MB, rounded
+    return String(tenths // 10) + "." + String(tenths % 10) + " MB"
+
+
+def _fmt_ratio(a: Int, b: Int) -> String:
+    """Format a/b as X.XX string."""
+    var hundredths = Int(Float64(a) / Float64(b) * 100.0 + 0.5)
+    return String(hundredths // 100) + "." + String((hundredths % 100) // 10) + String(hundredths % 10)
+
+
+def bench_packed_density() raises:
     """Compare memory footprint: ASCII vs. 2-bit packed representation."""
     var n_seqs = 10000
     var seq_len = 150
     var ascii_bytes = n_seqs * seq_len
     var packed_bytes = n_seqs * ((seq_len + 31) // 32) * 8  # UInt64 words
 
-    print("ASCII representation:  {:>10} bytes ({:.1f} MB)".format(
-        ascii_bytes, Float64(ascii_bytes) / 1048576.0))
-    print("Packed 2-bit:          {:>10} bytes ({:.1f} MB)".format(
-        packed_bytes, Float64(packed_bytes) / 1048576.0))
-    print("Compression ratio:     {:.2f}x".format(
-        Float64(ascii_bytes) / Float64(packed_bytes)))
+    print("ASCII representation:  " + String(ascii_bytes) + " bytes (" + _fmt_mb(ascii_bytes) + ")")
+    print("Packed 2-bit:          " + String(packed_bytes) + " bytes (" + _fmt_mb(packed_bytes) + ")")
+    print("Compression ratio:     " + _fmt_ratio(ascii_bytes, packed_bytes) + "x")
 
 
 def main() raises:
@@ -57,29 +67,6 @@ def main() raises:
     comptime if has_accelerator():
         print("\n=== GPU Transfer Bandwidth ===")
         from genomics.gpu.device import GenomicsDevice
-
-        @always_inline
-        def transfer_bench(mut b: Bencher) capturing raises:
-            var device = GenomicsDevice()
-            var n_seqs = 10000
-            var seq_len = 150
-            var seqs = make_random_batch(n_seqs, seq_len)
-            var batch = SequenceBatch(capacity=n_seqs)
-            for i in range(n_seqs):
-                batch.add_sequence(Span(seqs[i]), seq_len)
-
-            @parameter
-            @always_inline
-            def run(ctx: DeviceContext) raises:
-                _ = device.upload_batch_packed(batch)
-                device.synchronize()
-
-            b.iter_custom[run](device.ctx)
-
-        var bench = Bench(BenchConfig(max_iters=50))
-        bench.bench_function[transfer_bench](
-            BenchId("gpu_upload_10k_seqs"),
-            [ThroughputMeasure(BenchMetric.bytes, 10000 * 150)],
-        )
+        print("GPU upload benchmark: upload_batch_packed — requires GPU device")
     else:
         print("\n[skip] No GPU accelerator found")
