@@ -10,3 +10,9 @@ target/
 .vscode/
 .idea/
 **/skills-lock.json
+
+tests/fixtures/*.fasta
+./tests/fixtures/*.fasta
+
+
+CLAUDE.md
