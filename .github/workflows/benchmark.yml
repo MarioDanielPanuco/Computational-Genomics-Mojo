@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:  # allow manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   benchmark:
@@ -14,22 +14,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v9
-
-      - name: Install dependencies
-        run: |
-          nix develop --command bash -c "pixi install"
+      - name: Setup pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          cache: true
 
       - name: Run all benchmarks and record results
         continue-on-error: true
-        env:
-          BENCH_HOST: github-actions
         run: |
           chmod +x benchmarks/record.sh
-          nix develop --command bash -c "
-            BENCH_HOST=github-actions ./benchmarks/record.sh
-          "
+          BENCH_HOST=github-actions ./benchmarks/record.sh
 
       - name: Upload benchmark results
         if: always()
