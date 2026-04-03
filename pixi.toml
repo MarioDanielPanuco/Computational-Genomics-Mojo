@@ -12,7 +12,9 @@ max = "*"
 test         = "mojo test tests/"
 bench-kmer   = "mojo run benchmarks/bench_kmer.mojo"
 bench-align  = "mojo run benchmarks/bench_alignment.mojo"
+bench-memory = "mojo run benchmarks/bench_memory.mojo"
 build        = "mojo package genomics -o genomics.mojopkg"
+install-mojo = "curl https://get.modular.com | sh"
 
 [feature.dev.dependencies]
 python = ">=3.11"

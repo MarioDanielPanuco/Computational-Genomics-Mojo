@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v9
+        # DeterminateSystems enables flakes by default — no extra config needed
+
+      - name: Install dependencies and run tests
+        run: |
+          nix develop --command bash -c "
+            pixi install
+            pixi run test
+          "
+
+      - name: Run benchmarks
+        continue-on-error: true
+        run: |
+          nix develop --command bash -c "
+            pixi run bench-kmer
+            pixi run bench-align
+            pixi run bench-memory
+          "

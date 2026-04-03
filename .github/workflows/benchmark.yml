@@ -1,0 +1,40 @@
+name: Benchmarks
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # allow manual trigger from the Actions tab
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v9
+
+      - name: Install dependencies
+        run: |
+          nix develop --command bash -c "pixi install"
+
+      - name: Run all benchmarks and record results
+        continue-on-error: true
+        env:
+          BENCH_HOST: github-actions
+        run: |
+          chmod +x benchmarks/record.sh
+          nix develop --command bash -c "
+            BENCH_HOST=github-actions ./benchmarks/record.sh
+          "
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: benchmarks/results/*.jsonl
+          retention-days: 90

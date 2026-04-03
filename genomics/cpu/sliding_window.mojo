@@ -30,7 +30,7 @@ def _count_gc_in_word(word: UInt64) -> Int:
 
 def gc_content_sliding[window: Int](
     view: SequenceView,
-    out: UnsafePointer[Float32, MutAnyOrigin],
+    result: UnsafePointer[Float32, MutAnyOrigin],
 ):
     """Compute per-position GC fraction in a sliding window of size `window`.
 
@@ -51,7 +51,7 @@ def gc_content_sliding[window: Int](
     prefix.append(0)
 
     for w in range(n_words):
-        var word = view.packed_ptr[w]
+        var word = view.packed[w]
         var base_start = w * BASES_PER_WORD
         var n_bases = min(BASES_PER_WORD, view.length - base_start)
         var running = prefix[base_start]
@@ -65,7 +65,7 @@ def gc_content_sliding[window: Int](
     var inv_window = Float32(1.0) / Float32(window)
     for i in range(n_out):
         var gc = prefix[i + window] - prefix[i]
-        out[i] = Float32(gc) * inv_window
+        result[i] = Float32(gc) * inv_window
 
 
 # ===----------------------------------------------------------------------=== #
@@ -74,7 +74,7 @@ def gc_content_sliding[window: Int](
 
 def sequence_entropy_sliding[window: Int](
     view: SequenceView,
-    out: UnsafePointer[Float32, MutAnyOrigin],
+    result: UnsafePointer[Float32, MutAnyOrigin],
 ):
     """Compute Shannon entropy (bits) of the base distribution in each window.
 
@@ -111,7 +111,7 @@ def sequence_entropy_sliding[window: Int](
                 h -= p * log2(p)
         return h
 
-    out[0] = compute_entropy(freq, valid_bases)
+    result[0] = compute_entropy(freq, valid_bases)
 
     # Slide: add incoming base, remove outgoing base
     for i in range(1, n_out):
@@ -129,7 +129,7 @@ def sequence_entropy_sliding[window: Int](
             freq[b] += 1
             valid_bases += 1
 
-        out[i] = compute_entropy(freq, valid_bases)
+        result[i] = compute_entropy(freq, valid_bases)
 
 
 # ===----------------------------------------------------------------------=== #
