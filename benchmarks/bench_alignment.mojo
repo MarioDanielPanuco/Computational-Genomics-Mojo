@@ -17,6 +17,7 @@ from std.math import min
 from genomics.core.sequence import SequenceBatch, get_view
 from genomics.cpu.align_cpu import (
     smith_waterman_banded, needleman_wunsch_banded, default_config, AlignConfig,
+    wfa_affine_cpu, default_wfa_config, WFAConfig,
 )
 from benchmarks.harness import make_random_batch, make_random_dna
 
@@ -104,12 +105,49 @@ def bench_nw_vs_sw() raises:
     bench.dump_report()
 
 
+def bench_wfa_cpu[max_error: Int](n_pairs: Int, seq_len: Int) raises:
+    """Benchmark CPU gap-affine WFA for n_pairs random pairs at given seq_len."""
+    var q_seqs = make_random_batch(n_pairs, seq_len)
+    var r_seqs = make_random_batch(n_pairs, seq_len)
+    var queries = SequenceBatch(capacity=n_pairs)
+    var refs = SequenceBatch(capacity=n_pairs)
+    for i in range(n_pairs):
+        queries.add_sequence(Span(q_seqs[i]), seq_len)
+        refs.add_sequence(Span(r_seqs[i]), seq_len)
+
+    var cfg = default_wfa_config()
+    cfg.max_error = max_error
+
+    var bench = Bench(BenchConfig(max_iters=50))
+
+    @always_inline
+    def wfa_bench(mut b: Bencher) capturing raises:
+        @parameter
+        @always_inline
+        def run():
+            for i in range(min(n_pairs, queries.count)):
+                var q = get_view(queries, i)
+                var r = get_view(refs, i)
+                _ = wfa_affine_cpu(q, r, cfg)
+        b.iter[run]()
+
+    bench.bench_function[wfa_bench](
+        BenchId("wfa_cpu_maxerr" + String(max_error) + "_len" + String(seq_len) + "_n" + String(n_pairs)),
+        [ThroughputMeasure(BenchMetric.elements, n_pairs * seq_len)],
+    )
+    bench.dump_report()
+
+
 def main() raises:
     print("=== CPU Alignment Benchmarks ===")
     bench_alignment_cpu_scaling()
 
     print("\n=== NW vs SW Comparison ===")
     bench_nw_vs_sw()
+
+    print("\n=== CPU WFA Benchmarks ===")
+    bench_wfa_cpu[50](200, 150)
+    bench_wfa_cpu[200](50, 1000)
 
     comptime if has_accelerator():
         print("\n=== GPU Alignment Benchmarks ===")

@@ -31,6 +31,12 @@ comptime GAP_OPEN: Int = -5
 comptime GAP_EXT: Int = -2
 comptime NEG_INF: Int = -30000  # fits in Int16, safe sentinel
 
+# WFA default penalty model (positive costs)
+comptime WFA_MISMATCH: Int = 4   # x: mismatch cost
+comptime WFA_GAP_OPEN: Int = 6   # o: gap open cost
+comptime WFA_GAP_EXT: Int  = 2   # e: gap extend cost per base
+comptime WFA_BLOCK_SIZE: Int = 128
+
 
 # ===----------------------------------------------------------------------=== #
 # Utility: decode base from packed word
@@ -249,6 +255,205 @@ def wavefront_align_kernel[LT: TensorLayout](
 
 
 # ===----------------------------------------------------------------------=== #
+# Gap-affine WFA kernel
+# ===----------------------------------------------------------------------=== #
+
+def wfa_affine_kernel[
+    max_error: Int,
+    x: Int,
+    o: Int,
+    e: Int,
+    LT: TensorLayout,
+](
+    queries:    TileTensor[DType.uint64, LT, MutAnyOrigin],
+    refs:       TileTensor[DType.uint64, LT, MutAnyOrigin],
+    q_lengths:  TileTensor[DType.int32,  LT, MutAnyOrigin],
+    r_lengths:  TileTensor[DType.int32,  LT, MutAnyOrigin],
+    q_offsets:  TileTensor[DType.int32,  LT, MutAnyOrigin],
+    r_offsets:  TileTensor[DType.int32,  LT, MutAnyOrigin],
+    out_scores: TileTensor[DType.int32,  LT, MutAnyOrigin],
+):
+    """Gap-affine WFA global alignment — one thread-block per sequence pair.
+
+    Penalty model: mismatch costs x, gap of length l costs o + l*e.
+    Shared memory: three circular-buffer wavefront arrays (M, I, D).
+      M[s,k] — furthest query row on diagonal k at score s (match/mismatch end)
+      I[s,k] — same, ending in insertion (gap in reference; row advances)
+      D[s,k] — same, ending in deletion  (gap in query; col advances)
+    Diagonal k = row - col; target diagonal = qlen - rlen.
+    NEXT phase expands wavefronts; EXTEND phase advances through matches.
+    out_scores[pair_idx] = min cost, or -1 if cost > max_error.
+    """
+    comptime assert max_error >= 1, "max_error must be >= 1"
+    comptime assert e >= 1, "gap extend cost must be >= 1"
+    comptime MAX_DIAGS = 2 * max_error + 1
+    # M needs history back max(x, o+e) steps; +1 for circular buffer
+    comptime M_HIST_SIZE = (x if x > o + e else o + e) + 1
+    comptime IE_HIST_SIZE = e + 1
+    comptime WFA_NEG = -30000  # fits in Int32, safe NEG_INF sentinel
+
+    var pair_idx = Int(block_idx.x)
+    var qlen  = Int(rebind[Scalar[DType.int32]](q_lengths[pair_idx]))
+    var rlen  = Int(rebind[Scalar[DType.int32]](r_lengths[pair_idx]))
+    var q_off = Int(rebind[Scalar[DType.int32]](q_offsets[pair_idx]))
+    var r_off = Int(rebind[Scalar[DType.int32]](r_offsets[pair_idx]))
+    var tid   = Int(thread_idx.x)
+    var target_d = qlen - rlen
+
+    # Guard: if length difference alone exceeds budget, no alignment possible.
+    if target_d < -max_error or target_d > max_error:
+        if tid == 0:
+            out_scores[pair_idx] = rebind[out_scores.ElementType](Int32(-1))
+        return
+
+    # Shared memory circular buffers: flat index = slot * MAX_DIAGS + (d + max_error)
+    # M history: M_HIST_SIZE slots; I/D history: IE_HIST_SIZE slots
+    var M_sh = stack_allocation[DType.int32, address_space=AddressSpace.SHARED](
+        row_major[M_HIST_SIZE * MAX_DIAGS]()
+    )
+    var I_sh = stack_allocation[DType.int32, address_space=AddressSpace.SHARED](
+        row_major[IE_HIST_SIZE * MAX_DIAGS]()
+    )
+    var D_sh = stack_allocation[DType.int32, address_space=AddressSpace.SHARED](
+        row_major[IE_HIST_SIZE * MAX_DIAGS]()
+    )
+    # found_sh[0] = 0 (not found), or s+1 (found at score s)
+    var found_sh = stack_allocation[DType.int32, address_space=AddressSpace.SHARED](
+        row_major[1]()
+    )
+
+    # Initialize all history to WFA_NEG (thread-stride loop)
+    var j = tid
+    while j < M_HIST_SIZE * MAX_DIAGS:
+        M_sh[j] = rebind[M_sh.ElementType](Int32(WFA_NEG))
+        j += Int(block_dim.x)
+    j = tid
+    while j < IE_HIST_SIZE * MAX_DIAGS:
+        I_sh[j] = rebind[I_sh.ElementType](Int32(WFA_NEG))
+        D_sh[j] = rebind[D_sh.ElementType](Int32(WFA_NEG))
+        j += Int(block_dim.x)
+    if tid == 0:
+        found_sh[0] = rebind[found_sh.ElementType](Int32(0))
+        M_sh[0 * MAX_DIAGS + max_error] = rebind[M_sh.ElementType](Int32(0))
+    barrier()
+
+    # Extend score 0 on diagonal 0 (only diagonal active at s=0)
+    if tid == 0:
+        var row = Int(rebind[Scalar[DType.int32]](M_sh[0 * MAX_DIAGS + max_error]))
+        var col = row  # diagonal 0 → col == row
+        while row < qlen and col >= 0 and col < rlen:
+            if _decode_base(queries.unsafe_ptr() + q_off, row) != _decode_base(refs.unsafe_ptr() + r_off, col):
+                break
+            row += 1
+            col += 1
+        M_sh[0 * MAX_DIAGS + max_error] = rebind[M_sh.ElementType](Int32(row))
+        if target_d == 0 and row >= qlen:
+            found_sh[0] = rebind[found_sh.ElementType](Int32(1))  # score 0 + 1
+    barrier()
+
+    if Int(rebind[Scalar[DType.int32]](found_sh[0])) != 0:
+        if tid == 0:
+            out_scores[pair_idx] = rebind[out_scores.ElementType](Int32(0))
+        return
+
+    for s in range(1, max_error + 1):
+        var m_slot  = s % M_HIST_SIZE
+        var ie_slot = s % IE_HIST_SIZE
+
+        # Clear this score's slots before writing (thread-stride loop)
+        var j2 = tid
+        while j2 < MAX_DIAGS:
+            M_sh[m_slot  * MAX_DIAGS + j2] = rebind[M_sh.ElementType](Int32(WFA_NEG))
+            I_sh[ie_slot * MAX_DIAGS + j2] = rebind[I_sh.ElementType](Int32(WFA_NEG))
+            D_sh[ie_slot * MAX_DIAGS + j2] = rebind[D_sh.ElementType](Int32(WFA_NEG))
+            j2 += Int(block_dim.x)
+        barrier()
+
+        # Active diagonal range at score s
+        var lo = max(max(-rlen, -s), -max_error)
+        var hi = min(min(qlen,   s),  max_error)
+
+        # NEXT phase: expand wavefront for score s (threads stride over diagonals)
+        var d = lo + tid
+        while d <= hi:
+            var d_idx = d + max_error
+
+            # I[s,k] = max(M[s-o-e, k-1]+1, I[s-e, k-1]+1)  (insertion: row advances)
+            var i_val = WFA_NEG
+            if d_idx > 0:
+                if s >= o + e:
+                    var mv = Int(rebind[Scalar[DType.int32]](
+                        M_sh[((s - o - e) % M_HIST_SIZE) * MAX_DIAGS + d_idx - 1]))
+                    if mv != WFA_NEG:
+                        i_val = max(i_val, mv + 1)
+                if s >= e:
+                    var iv = Int(rebind[Scalar[DType.int32]](
+                        I_sh[((s - e) % IE_HIST_SIZE) * MAX_DIAGS + d_idx - 1]))
+                    if iv != WFA_NEG:
+                        i_val = max(i_val, iv + 1)
+            I_sh[ie_slot * MAX_DIAGS + d_idx] = rebind[I_sh.ElementType](Int32(i_val))
+
+            # D[s,k] = max(M[s-o-e, k+1], D[s-e, k+1])  (deletion: col advances)
+            var d_val = WFA_NEG
+            if d_idx < MAX_DIAGS - 1:
+                if s >= o + e:
+                    var mv = Int(rebind[Scalar[DType.int32]](
+                        M_sh[((s - o - e) % M_HIST_SIZE) * MAX_DIAGS + d_idx + 1]))
+                    if mv != WFA_NEG:
+                        d_val = max(d_val, mv)
+                if s >= e:
+                    var dv = Int(rebind[Scalar[DType.int32]](
+                        D_sh[((s - e) % IE_HIST_SIZE) * MAX_DIAGS + d_idx + 1]))
+                    if dv != WFA_NEG:
+                        d_val = max(d_val, dv)
+            D_sh[ie_slot * MAX_DIAGS + d_idx] = rebind[D_sh.ElementType](Int32(d_val))
+
+            # M[s,k] = max(M[s-x, k]+1, I[s,k], D[s,k])
+            var m_val = WFA_NEG
+            if s >= x:
+                var mv = Int(rebind[Scalar[DType.int32]](
+                    M_sh[((s - x) % M_HIST_SIZE) * MAX_DIAGS + d_idx]))
+                if mv != WFA_NEG:
+                    m_val = max(m_val, mv + 1)
+            if i_val != WFA_NEG:
+                m_val = max(m_val, i_val)
+            if d_val != WFA_NEG:
+                m_val = max(m_val, d_val)
+            M_sh[m_slot * MAX_DIAGS + d_idx] = rebind[M_sh.ElementType](Int32(m_val))
+
+            d += Int(block_dim.x)
+        barrier()
+
+        # EXTEND phase: advance through matching bases (threads stride over diagonals)
+        d = lo + tid
+        while d <= hi:
+            var d_idx = d + max_error
+            var row = Int(rebind[Scalar[DType.int32]](M_sh[m_slot * MAX_DIAGS + d_idx]))
+            if row != WFA_NEG and row >= 0:
+                var col = row - d
+                while row < qlen and col >= 0 and col < rlen:
+                    if _decode_base(queries.unsafe_ptr() + q_off, row) != _decode_base(refs.unsafe_ptr() + r_off, col):
+                        break
+                    row += 1
+                    col += 1
+                M_sh[m_slot * MAX_DIAGS + d_idx] = rebind[M_sh.ElementType](Int32(row))
+                if d == target_d and row >= qlen:
+                    found_sh[0] = rebind[found_sh.ElementType](Int32(s + 1))
+            d += Int(block_dim.x)
+        barrier()
+
+        if Int(rebind[Scalar[DType.int32]](found_sh[0])) != 0:
+            if tid == 0:
+                var result_s = Int(rebind[Scalar[DType.int32]](found_sh[0])) - 1
+                out_scores[pair_idx] = rebind[out_scores.ElementType](Int32(result_s))
+            return
+
+    # Exceeded max_error
+    if tid == 0:
+        out_scores[pair_idx] = rebind[out_scores.ElementType](Int32(-1))
+
+
+# ===----------------------------------------------------------------------=== #
 # Host-side launch wrappers
 # ===----------------------------------------------------------------------=== #
 
@@ -284,5 +489,47 @@ def launch_banded_sw[band: Int](
         TileTensor(scores_buf, pair_layout),
         grid_dim=n_pairs,
         block_dim=ALIGN_BLOCK_SIZE,
+    )
+    return scores_buf
+
+
+def launch_wfa_affine[
+    max_error: Int,
+    x: Int,
+    o: Int,
+    e: Int,
+](
+    device: GenomicsDevice,
+    queries_buf: DeviceBuffer[DType.uint64],
+    refs_buf: DeviceBuffer[DType.uint64],
+    q_lengths_buf: DeviceBuffer[DType.int32],
+    r_lengths_buf: DeviceBuffer[DType.int32],
+    q_offsets_buf: DeviceBuffer[DType.int32],
+    r_offsets_buf: DeviceBuffer[DType.int32],
+    n_pairs: Int,
+    total_words: Int,
+) raises -> DeviceBuffer[DType.int32]:
+    """Launch gap-affine WFA for n_pairs sequence pairs.
+
+    Returns a device buffer of length n_pairs with minimum alignment costs.
+    A value of -1 indicates the cost exceeded max_error.
+    """
+    var scores_buf = device.ctx.enqueue_create_buffer[DType.int32](n_pairs)
+    scores_buf.enqueue_fill(0)
+
+    var flat_layout = row_major(Idx(total_words))
+    var pair_layout = row_major(Idx(n_pairs))
+
+    comptime kernel = wfa_affine_kernel[max_error, x, o, e, type_of(flat_layout)]
+    device.ctx.enqueue_function[kernel, kernel](
+        TileTensor(queries_buf, flat_layout),
+        TileTensor(refs_buf, flat_layout),
+        TileTensor(q_lengths_buf, pair_layout),
+        TileTensor(r_lengths_buf, pair_layout),
+        TileTensor(q_offsets_buf, pair_layout),
+        TileTensor(r_offsets_buf, pair_layout),
+        TileTensor(scores_buf, pair_layout),
+        grid_dim=n_pairs,
+        block_dim=WFA_BLOCK_SIZE,
     )
     return scores_buf

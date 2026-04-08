@@ -12,7 +12,10 @@ at realistic sequence lengths, not just hand-crafted 4-33 bp examples.
 from std.testing import assert_equal, assert_true, TestSuite
 from genomics.core.sequence import get_view
 from genomics.cpu.kmer_cpu import extract_kmers, kmer_frequencies
-from genomics.cpu.align_cpu import smith_waterman_banded, default_config
+from genomics.cpu.align_cpu import (
+    smith_waterman_banded, default_config,
+    wfa_affine_cpu, default_wfa_config,
+)
 from genomics.cpu.sliding_window import (
     gc_content_sliding, sequence_entropy_sliding, complexity_score,
 )
@@ -185,6 +188,35 @@ def test_complexity_real_sequence() raises:
     var view = get_view(batch, 0)
     var score = complexity_score[2](view)
     assert_true(score > Float32(0.8))
+
+
+# ===----------------------------------------------------------------------=== #
+# WFA real-data tests
+# ===----------------------------------------------------------------------=== #
+
+def test_wfa_phix_self_alignment() raises:
+    """WFA cost of PhiX[0:100] aligned to itself should be 0."""
+    var seq = load_fasta_seq("tests/fixtures/phix174.fasta")
+    var batch = make_batch_substr(seq, 0, 100)
+    var cfg = default_wfa_config()
+    var cost = wfa_affine_cpu(get_view(batch, 0), get_view(batch, 0), cfg)
+    assert_equal(cost, 0)
+
+
+def test_wfa_phix_vs_sars() raises:
+    """WFA cost of PhiX[0:100] vs SARS[0:100] exceeds 50 edits (distant sequences).
+
+    We cap max_error=50 so the function returns -1 quickly rather than running to 200.
+    A -1 result means cost > 50, confirming the sequences are unrelated.
+    """
+    var phix_seq = load_fasta_seq("tests/fixtures/phix174.fasta")
+    var sars_seq = load_fasta_seq("tests/fixtures/sars_cov2.fasta")
+    var phix_batch = make_batch_substr(phix_seq, 0, 100)
+    var sars_batch = make_batch_substr(sars_seq, 0, 100)
+    var cfg = default_wfa_config()
+    cfg.max_error = 50
+    var cost = wfa_affine_cpu(get_view(phix_batch, 0), get_view(sars_batch, 0), cfg)
+    assert_equal(cost, -1)  # exceeded max_error=50 → edit distance > 50
 
 
 def main() raises:
