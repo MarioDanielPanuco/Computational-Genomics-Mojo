@@ -36,6 +36,13 @@ struct AlignResult(Movable):
     var cigar: List[UInt8]   # run-length encoded: high 4 bits = op, low 4 bits = len
 
 
+@fieldwise_init
+struct WFAResult(Movable):
+    """WFA alignment result with score and extended CIGAR traceback."""
+    var score: Int
+    var cigar: String  # run-length extended CIGAR e.g. "3=1X2I5=" (=match X mismatch I ins D del)
+
+
 def default_config() -> AlignConfig:
     return AlignConfig(
         match_score=2,
@@ -368,3 +375,249 @@ def needleman_wunsch_banded(
         ref_end=rlen - 1,
         cigar=List[UInt8](),
     )
+
+
+def wfa_affine_cigar_cpu(
+    query: SequenceView,
+    ref_seq: SequenceView,
+    cfg: WFAConfig,
+) -> WFAResult:
+    """Gap-affine WFA with full CIGAR traceback via complete wavefront history.
+
+    Unlike wfa_affine_cpu (O(s) circular buffer), this stores all wavefront
+    scores — O(s * max_diags) memory — so backtracking is possible.
+
+    Returns WFAResult with the optimal cost and an extended CIGAR string using
+    '=' (sequence match), 'X' (mismatch), 'I' (insertion), 'D' (deletion).
+    Returns score=-1 with empty CIGAR if alignment cost exceeds cfg.max_error.
+    """
+    var qlen = query.length
+    var rlen = ref_seq.length
+    if qlen == 0 and rlen == 0:
+        return WFAResult(score=0, cigar=String(""))
+
+    var x = cfg.x
+    var o = cfg.o
+    var e = cfg.e
+    var max_err = cfg.max_error
+
+    var n_diags = 2 * max_err + 1
+    var offset = max_err
+    comptime NEG_INF = -1_000_000
+
+    # Full wavefront history (not circular) so backtracking can reach any score.
+    # Index: s * n_diags + (diagonal + offset)
+    var total = (max_err + 1) * n_diags
+    var M_pre  = List[Int](capacity=total)   # furthest row BEFORE extend phase
+    var M_full = List[Int](capacity=total)   # furthest row AFTER  extend phase
+    var I_arr  = List[Int](capacity=total)   # I wavefront (insertion state)
+    var D_arr  = List[Int](capacity=total)   # D wavefront (deletion  state)
+
+    for _ in range(total):
+        M_pre.append(NEG_INF)
+        M_full.append(NEG_INF)
+        I_arr.append(NEG_INF)
+        D_arr.append(NEG_INF)
+
+    # --- Score 0 base case: diagonal 0, extend through leading matches ---
+    M_pre[offset] = 0
+    var r0 = 0
+    while r0 < qlen and r0 < rlen and query.get_base(r0) == ref_seq.get_base(r0):
+        r0 += 1
+    M_full[offset] = r0
+
+    var target_d = qlen - rlen
+    var opt_score = -1
+
+    if target_d >= -max_err and target_d <= max_err:
+        if M_full[offset + target_d] >= qlen:
+            opt_score = 0
+
+    # --- Main WFA loop ---
+    if opt_score == -1:
+        for s in range(1, max_err + 1):
+            var lo = max(-rlen, -s)
+            var hi = min(qlen, s)
+            if target_d < lo:
+                lo = min(lo, target_d)
+            if target_d > hi:
+                hi = max(hi, target_d)
+            lo = max(lo, -max_err)
+            hi = min(hi, max_err)
+
+            for d in range(lo, hi + 1):
+                var di = d + offset
+
+                # I[s,d] = max(M_full[s-o-e, d-1]+1, I[s-e, d-1]+1)
+                var i_val = NEG_INF
+                if di > 0:
+                    if s >= o + e:
+                        var mv = M_full[(s - o - e) * n_diags + di - 1]
+                        if mv != NEG_INF:
+                            i_val = max(i_val, mv + 1)
+                    if s >= e:
+                        var iv = I_arr[(s - e) * n_diags + di - 1]
+                        if iv != NEG_INF:
+                            i_val = max(i_val, iv + 1)
+                I_arr[s * n_diags + di] = i_val
+
+                # D[s,d] = max(M_full[s-o-e, d+1], D[s-e, d+1])
+                var d_val = NEG_INF
+                if di < n_diags - 1:
+                    if s >= o + e:
+                        var mv = M_full[(s - o - e) * n_diags + di + 1]
+                        if mv != NEG_INF:
+                            d_val = max(d_val, mv)
+                    if s >= e:
+                        var dv = D_arr[(s - e) * n_diags + di + 1]
+                        if dv != NEG_INF:
+                            d_val = max(d_val, dv)
+                D_arr[s * n_diags + di] = d_val
+
+                # M[s,d] = max(M_full[s-x, d]+1, I[s,d], D[s,d])
+                var m_val = NEG_INF
+                if s >= x:
+                    var mv = M_full[(s - x) * n_diags + di]
+                    if mv != NEG_INF:
+                        m_val = max(m_val, mv + 1)
+                if i_val != NEG_INF:
+                    m_val = max(m_val, i_val)
+                if d_val != NEG_INF:
+                    m_val = max(m_val, d_val)
+                M_pre[s * n_diags + di] = m_val
+
+                # Extend through matches on this diagonal
+                if m_val != NEG_INF:
+                    var row = m_val
+                    var col = row - d
+                    while row < qlen and col >= 0 and col < rlen:
+                        if query.get_base(row) != ref_seq.get_base(col):
+                            break
+                        row += 1
+                        col += 1
+                    M_full[s * n_diags + di] = row
+
+            # Termination check
+            if target_d >= lo and target_d <= hi:
+                if M_full[s * n_diags + offset + target_d] >= qlen:
+                    opt_score = s
+                    break
+
+    if opt_score == -1:
+        return WFAResult(score=-1, cigar=String(""))
+
+    # --- Backtrack: build ops in reverse (last alignment op first) ---
+    # Op codes: 0='=', 1='X', 2='I', 3='D'
+    var ops_rev = List[UInt8]()
+    var cur_s = opt_score
+    var cur_d = target_d
+    var cur_matrix = 0   # 0=M, 1=I, 2=D
+    var cur_row = M_full[opt_score * n_diags + target_d + offset]  # = qlen
+
+    while True:
+        var di = cur_d + offset
+
+        if cur_matrix == 0:  # --- M state ---
+            var pre_r = M_pre[cur_s * n_diags + di]
+            # Emit match run (extend phase)
+            for _ in range(cur_row - pre_r):
+                ops_rev.append(UInt8(0))  # '='
+            cur_row = pre_r
+
+            if cur_s == 0 and cur_d == 0:
+                break  # reached initial state; pre_r == 0
+
+            # Priority: mismatch, then I, then D (any valid optimal path)
+            if cur_s >= x:
+                var prev_m = M_full[(cur_s - x) * n_diags + di]
+                if prev_m != NEG_INF and prev_m + 1 == cur_row:
+                    ops_rev.append(UInt8(1))  # 'X'
+                    cur_s -= x
+                    cur_row = prev_m   # = M_full[cur_s][cur_d] (extended)
+                    continue
+
+            var i_here = I_arr[cur_s * n_diags + di]
+            if i_here != NEG_INF and i_here == cur_row:
+                cur_matrix = 1
+                continue      # cur_row already equals i_here
+
+            var d_here = D_arr[cur_s * n_diags + di]
+            if d_here != NEG_INF and d_here == cur_row:
+                cur_matrix = 2
+                continue
+
+            break  # should not reach here on a valid WFA trace
+
+        elif cur_matrix == 1:  # --- I state: row advanced, diagonal increased ---
+            ops_rev.append(UInt8(2))  # 'I'
+            var prev_d = cur_d - 1
+            var prev_di = prev_d + offset
+
+            # Prefer gap-open source (M) over gap-extend source (I)
+            if cur_s >= o + e and prev_di >= 0:
+                var mv = M_full[(cur_s - o - e) * n_diags + prev_di]
+                if mv != NEG_INF and mv + 1 == cur_row:
+                    cur_s -= o + e
+                    cur_d = prev_d
+                    cur_row = mv   # extended M at new (cur_s, cur_d)
+                    cur_matrix = 0
+                    continue
+
+            if cur_s >= e and prev_di >= 0:
+                var iv = I_arr[(cur_s - e) * n_diags + prev_di]
+                if iv != NEG_INF and iv + 1 == cur_row:
+                    cur_s -= e
+                    cur_d = prev_d
+                    cur_row = iv   # I value at new (cur_s, cur_d)
+                    cur_matrix = 1
+                    continue
+
+            break  # should not reach here
+
+        else:  # cur_matrix == 2, --- D state: col advanced, diagonal decreased ---
+            ops_rev.append(UInt8(3))  # 'D'
+            var prev_d = cur_d + 1
+            var prev_di = prev_d + offset
+
+            # Prefer gap-open source (M) over gap-extend source (D)
+            if cur_s >= o + e and prev_di < n_diags:
+                var mv = M_full[(cur_s - o - e) * n_diags + prev_di]
+                if mv != NEG_INF and mv == cur_row:
+                    cur_s -= o + e
+                    cur_d = prev_d
+                    cur_row = mv
+                    cur_matrix = 0
+                    continue
+
+            if cur_s >= e and prev_di < n_diags:
+                var dv = D_arr[(cur_s - e) * n_diags + prev_di]
+                if dv != NEG_INF and dv == cur_row:
+                    cur_s -= e
+                    cur_d = prev_d
+                    cur_row = dv
+                    cur_matrix = 2
+                    continue
+
+            break  # should not reach here
+
+    # --- Build RLE CIGAR string (ops_rev is reversed; read from end to start) ---
+    var cigar = String("")
+    var ops_len = len(ops_rev)
+    var i = ops_len - 1
+    while i >= 0:
+        var op = ops_rev[i]
+        var cnt = 1
+        while i - cnt >= 0 and ops_rev[i - cnt] == op:
+            cnt += 1
+        cigar += String(cnt)
+        if op == 0:
+            cigar += "="
+        elif op == 1:
+            cigar += "X"
+        elif op == 2:
+            cigar += "I"
+        else:
+            cigar += "D"
+        i -= cnt
+
+    return WFAResult(score=opt_score, cigar=cigar)
